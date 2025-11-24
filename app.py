@@ -22,8 +22,8 @@ def obtener_api_key():
 api_key = obtener_api_key()
 genai.configure(api_key=api_key)
 
-# !!! AQUÍ ESTABA EL PROBLEMA. FORZAMOS EL MODELO FLASH !!!
-MODELO_SOLIDO = "models/gemini-1.5-flash" 
+# --- CAMBIO IMPORTANTE: SOLO EL NOMBRE CORTO ---
+MODELO_USAR = "gemini-1.5-flash" 
 
 # ==========================================
 # LÓGICA
@@ -41,39 +41,36 @@ def limpiar_json(texto_sucio):
     except:
         return None
 
-def procesar_factura_blindada(archivo_temporal):
-    """Esta función tiene reintentos automáticos si sale error 429"""
+def procesar_factura(archivo_temporal):
     archivo_subido = None
-    
-    # 1. Subir archivo
     try:
+        # 1. Subir
         archivo_subido = genai.upload_file(archivo_temporal, mime_type="application/pdf")
         
-        # Esperar a que procese
-        intentos_espera = 0
+        # Esperar procesamiento
+        espera = 0
         while archivo_subido.state.name == "PROCESSING":
             time.sleep(2)
             archivo_subido = genai.get_file(archivo_subido.name)
-            intentos_espera += 1
-            if intentos_espera > 20: return {'estado': 'ERROR', 'error_log': 'Timeout subida'}
+            espera += 1
+            if espera > 20: return {'estado': 'ERROR', 'error_log': 'Timeout subida'}
 
     except Exception as e:
         return {'estado': 'ERROR', 'error_log': f"Error subiendo: {str(e)}"}
 
-    # 2. Pedir datos a la IA (Con reintentos)
-    modelo = genai.GenerativeModel(MODELO_SOLIDO)
+    # 2. Generar (Con reintentos para evitar bloqueos)
+    modelo = genai.GenerativeModel(MODELO_USAR)
     prompt = """
-    Extrae en JSON: numero_contrato, nit_empresa, nombre_empresa, fecha_expedicion (YYYY-MM-DD), fecha_limite (YYYY-MM-DD), valor_pagar (numero).
-    Si no existe, null.
+    Extrae datos en JSON. Campos: numero_contrato, nit_empresa, nombre_empresa, fecha_expedicion (YYYY-MM-DD), fecha_limite (YYYY-MM-DD), valor_pagar (numero).
+    Si no hay dato, usa null.
     """
 
-    MAX_REINTENTOS = 3
-    for intento in range(MAX_REINTENTOS):
+    for i in range(3): # 3 Intentos
         try:
             respuesta = modelo.generate_content([archivo_subido, prompt])
             datos = limpiar_json(respuesta.text)
             
-            # Si todo sale bien, limpiamos y retornamos
+            # Limpiar y salir
             try: genai.delete_file(archivo_subido.name)
             except: pass
             
@@ -81,26 +78,27 @@ def procesar_factura_blindada(archivo_temporal):
                 datos['estado'] = 'OK'
                 return datos
             else:
-                return {'estado': 'ERROR', 'error_log': 'JSON Inválido'}
-
+                return {'estado': 'ERROR', 'error_log': 'JSON invalido'}
+                
         except Exception as e:
-            error_msg = str(e)
-            # Si es error de cuota (429), esperamos y reintentamos
-            if "429" in error_msg or "quota" in error_msg.lower():
-                time.sleep(15) # Espera larga de seguridad
-                continue # Vuelve al inicio del loop
+            if "429" in str(e) or "quota" in str(e).lower():
+                time.sleep(10) # Esperar si hay bloqueo
+                continue
+            elif "404" in str(e):
+                # Si sigue saliendo 404, es fallo critico del modelo
+                try: genai.delete_file(archivo_subido.name)
+                except: pass
+                return {'estado': 'ERROR', 'error_log': f"Modelo no encontrado: {MODELO_USAR}"}
             else:
-                # Si es otro error, fallamos
                 try: genai.delete_file(archivo_subido.name)
                 except: pass
                 return {'estado': 'ERROR', 'error_log': str(e)}
-    
-    return {'estado': 'ERROR', 'error_log': 'Falló tras 3 intentos (Cuota excedida)'}
+
+    return {'estado': 'ERROR', 'error_log': 'Fallo por cuota (Intentos agotados)'}
 
 # ==========================================
 # INTERFAZ
 # ==========================================
-
 st.title("🧾 Extractor de Facturas")
 
 uploaded_files = st.file_uploader("Sube PDFs", type="pdf", accept_multiple_files=True)
@@ -108,37 +106,27 @@ uploaded_files = st.file_uploader("Sube PDFs", type="pdf", accept_multiple_files
 if uploaded_files and st.button("Procesar"):
     resultados = []
     barra = st.progress(0)
-    status = st.empty()
-    
-    total = len(uploaded_files)
     
     for i, pdf in enumerate(uploaded_files):
-        status.text(f"Procesando {i+1}/{total}: {pdf.name}...")
-        
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(pdf.getvalue())
             path = tmp.name
         
-        datos = procesar_factura_blindada(path)
+        datos = procesar_factura(path)
         datos['archivo'] = pdf.name
         
         if datos.get('estado') == 'ERROR':
             st.error(f"{pdf.name}: {datos.get('error_log')}")
-        
+        else:
+            st.success(f"Leído: {pdf.name}")
+            
         resultados.append(datos)
         os.unlink(path)
-        
-        barra.progress((i+1)/total)
-        
-        # FRENADO INTENCIONAL: Esperar 4 segundos entre facturas para no saturar
-        time.sleep(4)
-
-    status.success("¡Terminado!")
+        barra.progress((i+1)/len(uploaded_files))
+        time.sleep(2) # Pausa pequeña
 
     if resultados:
         df = pd.DataFrame(resultados)
-        st.dataframe(df)
-        
         buffer = BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df.to_excel(writer, index=False)
