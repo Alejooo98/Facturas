@@ -14,58 +14,81 @@ from datetime import datetime
 st.set_page_config(page_title="Extractor de Facturas IA", page_icon="🧾", layout="wide")
 
 # ==========================================
-# LÓGICA (Tu código adaptado)
+# LÓGICA (CONFIGURACIÓN DE SECRETOS)
 # ==========================================
 
-def configurar_ia(api_key):
+def obtener_api_key():
+    """Intenta obtener la API KEY de los secretos de Streamlit"""
     try:
-        genai.configure(api_key=api_key)
-        return True
-    except Exception as e:
-        st.error(f"Error configurando API: {e}")
-        return False
+        # Busca en la caja fuerte de la nube
+        return st.secrets["GOOGLE_API_KEY"]
+    except FileNotFoundError:
+        st.error("❌ NO SE ENCONTRÓ LA API KEY. Configura los 'Secrets' en Streamlit Cloud.")
+        st.stop()
+    except KeyError:
+        st.error("❌ La clave 'GOOGLE_API_KEY' no está definida en los secretos.")
+        st.stop()
+
+# --- CONFIGURACIÓN AUTOMÁTICA (INVISIBLE AL USUARIO) ---
+api_key = obtener_api_key()
+genai.configure(api_key=api_key)
+
+
+# ==========================================
+# FUNCIONES DE PROCESAMIENTO
+# ==========================================
+
+def limpiar_json(texto_sucio):
+    try:
+        texto = texto_sucio.replace('```json', '').replace('```', '').strip()
+        inicio = texto.find('{')
+        fin = texto.rfind('}') + 1
+        if inicio != -1 and fin != -1:
+            return json.loads(texto[inicio:fin])
+        else:
+            return None
+    except:
+        return None
 
 def subir_y_procesar(archivo_temporal, modelo_nombre):
-    """Sube el archivo a Gemini y extrae datos"""
     archivo_subido = None
     try:
-        # Subir a Google
         archivo_subido = genai.upload_file(archivo_temporal, mime_type="application/pdf")
         
-        # Esperar procesamiento
+        intentos = 0
         while archivo_subido.state.name == "PROCESSING":
-            time.sleep(1)
+            time.sleep(2)
             archivo_subido = genai.get_file(archivo_subido.name)
+            intentos += 1
+            if intentos > 20: return {'estado': 'ERROR', 'error_log': 'Timeout Google'}
 
-        # Generar contenido
+        if archivo_subido.state.name == "FAILED":
+             return {'estado': 'ERROR', 'error_log': 'Fallo procesamiento Google'}
+
         modelo = genai.GenerativeModel(modelo_nombre)
         
         prompt = """
-        Analiza esta factura y extrae los siguientes datos en formato JSON estricto.
-        Si un dato no aparece, usa null. Usa formato ISO para fechas (YYYY-MM-DD).
-        
-        Campos requeridos:
-        1. numero_contrato: (Busca cuenta, referencia o contrato)
-        2. nit_empresa: (Solo números y guiones)
-        3. nombre_empresa: (Ej: Claro, Movistar, Enel)
-        4. fecha_expedicion
-        5. fecha_limite
-        6. valor_pagar: (Número decimal puro, sin símbolos $)
+        Actúa como contable experto. Extrae datos en JSON. Si no existe usa null.
+        Estructura:
+        {
+            "numero_contrato": "texto",
+            "nit_empresa": "texto",
+            "nombre_empresa": "texto",
+            "fecha_expedicion": "YYYY-MM-DD",
+            "fecha_limite": "YYYY-MM-DD",
+            "valor_pagar": numero
+        }
         """
-
         respuesta = modelo.generate_content([archivo_subido, prompt])
+        datos_limpios = limpiar_json(respuesta.text)
         
-        # Limpieza JSON
-        texto_limpio = respuesta.text.replace('```json', '').replace('```', '').strip()
-        start = texto_limpio.find('{')
-        end = texto_limpio.rfind('}') + 1
-        json_final = json.loads(texto_limpio[start:end])
-        
-        json_final['estado'] = 'OK'
-        
-        # Limpiar nube
-        genai.delete_file(archivo_subido.name)
-        return json_final
+        if datos_limpios:
+            datos_limpios['estado'] = 'OK'
+            try: genai.delete_file(archivo_subido.name)
+            except: pass
+            return datos_limpios
+        else:
+            return {'estado': 'ERROR', 'error_log': 'JSON Inválido', 'raw': respuesta.text[:50]}
 
     except Exception as e:
         if archivo_subido:
@@ -74,83 +97,50 @@ def subir_y_procesar(archivo_temporal, modelo_nombre):
         return {'estado': 'ERROR', 'error_log': str(e)}
 
 # ==========================================
-# INTERFAZ DE USUARIO (FRONTEND)
+# INTERFAZ (LIMPIA, SIN PEDIR CLAVES)
 # ==========================================
 
-st.title("🧾 Extractor Inteligente de Facturas")
-st.markdown("Sube tus PDFs y la IA extraerá la información clave a Excel.")
+st.title("🧾 Extractor de Facturas")
+st.info("Sistema listo para procesar. La IA está conectada internamente.")
 
-# --- BARRA LATERAL ---
-with st.sidebar:
-    st.header("Configuración")
-    # Input seguro para la API Key (tipo password para que no se vea)
-    api_key_input = st.text_input("Tu API Key de Google Gemini", type="password")
+uploaded_files = st.file_uploader("Sube tus PDFs aquí", type="pdf", accept_multiple_files=True)
+
+if uploaded_files and st.button("🚀 Procesar"):
     
-    if not api_key_input:
-        st.warning("Por favor ingresa tu API Key para empezar.")
-        st.stop() # Detiene la ejecución hasta que haya clave
+    resultados = []
+    barra = st.progress(0)
+    caja_info = st.empty()
+    total = len(uploaded_files)
 
-    st.info("Modelo: Gemini 1.5 Flash (Automático)")
+    for i, uploaded_file in enumerate(uploaded_files):
+        caja_info.text(f"Leyendo: {uploaded_file.name}...")
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_path = tmp_file.name
 
-# Configurar IA con la clave ingresada por el usuario
-configurar_ia(api_key_input)
+        datos = subir_y_procesar(tmp_path, "gemini-1.5-flash")
+        datos['archivo'] = uploaded_file.name
+        
+        if datos.get('estado') == 'ERROR':
+            st.error(f"Fallo en {uploaded_file.name}: {datos.get('error_log')}")
+        
+        resultados.append(datos)
+        os.unlink(tmp_path)
+        barra.progress((i + 1) / total)
 
-# --- ZONA DE CARGA ---
-uploaded_files = st.file_uploader("Arrastra tus facturas aquí (PDF)", type="pdf", accept_multiple_files=True)
-
-if uploaded_files:
-    st.success(f"Se han cargado {len(uploaded_files)} archivos.")
+    caja_info.success("¡Listo!")
     
-    if st.button("🚀 Procesar Facturas"):
-        resultados = []
-        barra_progreso = st.progress(0)
-        status_text = st.empty()
-        
-        total_archivos = len(uploaded_files)
-
-        for i, uploaded_file in enumerate(uploaded_files):
-            status_text.text(f"Analizando: {uploaded_file.name}...")
-            
-            # Streamlit tiene el archivo en memoria, Gemini necesita un path o bytes
-            # Creamos un archivo temporal en el disco
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
-                tmp_path = tmp_file.name
-
-            # Llamar a la IA
-            datos = subir_y_procesar(tmp_path, "gemini-1.5-flash")
-            datos['archivo'] = uploaded_file.name
-            resultados.append(datos)
-            
-            # Borrar archivo temporal del disco local
-            os.unlink(tmp_path)
-            
-            # Actualizar barra
-            barra_progreso.progress((i + 1) / total_archivos)
-
-        status_text.text("✅ ¡Proceso completado!")
-        
-        # --- RESULTADOS ---
+    if resultados:
         df = pd.DataFrame(resultados)
-        
-        # Reordenar columnas si existen
-        cols_deseadas = ['archivo', 'estado', 'nombre_empresa', 'nit_empresa', 
-                         'numero_contrato', 'fecha_expedicion', 'fecha_limite', 'valor_pagar']
-        cols_finales = [c for c in cols_deseadas if c in df.columns]
+        cols = ['archivo', 'estado', 'nombre_empresa', 'valor_pagar', 'fecha_limite', 'nit_empresa', 'numero_contrato', 'error_log']
+        cols_finales = [c for c in cols if c in df.columns]
         df = df[cols_finales]
 
-        st.subheader("Vista Previa de Resultados")
         st.dataframe(df)
-
-        # --- DESCARGA EXCEL ---
-        # Crear Excel en memoria RAM (buffer)
+        
         buffer = BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False, sheet_name='Facturas')
+            df.to_excel(writer, index=False)
             
-        st.download_button(
-            label="📥 Descargar Reporte Excel",
-            data=buffer.getvalue(),
-            file_name=f"Reporte_Facturas_{datetime.now().strftime('%H%M')}.xlsx",
-            mime="application/vnd.ms-excel"
-        )
+        st.download_button("📥 Descargar Excel", buffer.getvalue(), "Facturas.xlsx", "application/vnd.ms-excel")
